@@ -36,6 +36,13 @@ public:
         Helicopter
     };
 
+    enum class DataSource {
+        OpenSky = 0,
+        AdsbFi  = 1,
+        AirplanesLive = 2
+    };
+    static constexpr int SOURCE_COUNT = 3;
+
     StellAirium();
     ~StellAirium() override;
 
@@ -58,19 +65,23 @@ public:
     QString getStelObjectType() const override { return QStringLiteral("Aircraft"); }
 
     // --- Properties ---
-    bool   isEnabled()          const { return enabled_; }
-    double getRadiusKm()        const { return radiusKm_; }
-    int    getRefreshInterval() const { return refreshInterval_; }
-    bool   getShowOnGround()    const { return showOnGround_; }
+    bool       isEnabled()          const { return enabled_; }
+    double     getRadiusKm()        const { return radiusKm_; }
+    int        getRefreshInterval() const { return refreshInterval_; }
+    bool       getShowOnGround()    const { return showOnGround_; }
+    DataSource getPreferredSource() const { return preferredSource_; }
+    DataSource getActiveSource()    const { return activeSource_; }
 
-    int    getAircraftCount()   const { return aircrafts_.size(); }
-    QString getStatusText()     const;
+    int     getAircraftCount() const { return aircrafts_.size(); }
+    QString getStatusText()    const;
+    static QString sourceName(DataSource s);
 
 public slots:
     void setEnabled(bool v);
     void setRadiusKm(double km);
     void setRefreshInterval(int secs);
     void setShowOnGround(bool v);
+    void setPreferredSource(DataSource s);
     void fetchNow();
 
 signals:
@@ -79,6 +90,7 @@ signals:
     void refreshIntervalChanged(int);
     void showOnGroundChanged(bool);
     void aircraftUpdated();
+    void activeSourceChanged(DataSource);
 
 private slots:
     void onTimer();
@@ -96,6 +108,16 @@ private:
     void queueMetaRequest(const QString& icao24);
     StelTextureSP getIcon(const AircraftObjP& ac) const;
 
+    // --- Data source helpers ---
+    QString buildUrl(DataSource s) const;
+    void parseOpenSky(const QJsonDocument& doc);
+    void parseAdsbFi(const QJsonDocument& doc);
+    void parseAirplanesLive(const QJsonDocument& doc);
+    void parseAdsbExchange(const QJsonDocument& doc, DataSource src);
+    DataSource nextSource(DataSource from) const;
+    void markRateLimited(DataSource s);
+    bool isRateLimited(DataSource s) const;
+
     // --- Icon generation ---
     static QImage makeIconImage(AcCategory cat, int sz = 64);
     static AcCategory categoryFromTypecode(const QString& tc);
@@ -111,6 +133,12 @@ private:
     int     refreshInterval_ {15};
     bool    showOnGround_    {false};
 
+    DataSource preferredSource_ {DataSource::OpenSky};
+    DataSource activeSource_    {DataSource::OpenSky};
+
+    // Per-source rate-limit expiry (invalid = not rate limited)
+    QDateTime rateLimitedUntil_[SOURCE_COUNT];
+
     QMap<QString, AircraftObjP> aircrafts_;
 
     QNetworkAccessManager* netManager_   {nullptr};
@@ -124,9 +152,9 @@ private:
     QNetworkAccessManager* metaManager_  {nullptr};
     QTimer*                metaTimer_    {nullptr};
     bool                   metaFetching_ {false};
-    QMap<QString, AcCategory> typeCache_; // icao24 → category
-    QSet<QString>          metaQueued_;   // already queued / fetched
-    QStringList            metaQueue_;    // pending icao24s
+    QMap<QString, AcCategory> typeCache_;
+    QSet<QString>          metaQueued_;
+    QStringList            metaQueue_;
 
     // --- Icon textures ---
     QMap<AcCategory, StelTextureSP> icons_;

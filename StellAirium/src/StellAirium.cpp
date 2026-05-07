@@ -507,6 +507,14 @@ void StellAirium::drawAircraft(StelCore* core)
 
     painter.setFont(QFont(QStringLiteral("sans-serif"), 7));
 
+    // Determine selected aircraft (if any)
+    const StelObject* selectedRaw = nullptr;
+    {
+        const QList<StelObjectP>& sel = StelApp::getInstance().getStelObjectMgr().getSelectedObject();
+        if (!sel.isEmpty())
+            selectedRaw = sel.first().get();
+    }
+
     for (const auto& ac : aircrafts_)
     {
         if (!showOnGround_ && ac->isOnGround()) continue;
@@ -590,11 +598,22 @@ void StellAirium::drawAircraft(StelCore* core)
         // Rotation angle: CW from "up-on-screen"
         float rotDeg = atan2f(screenDx, -screenDy) * 180.f / static_cast<float>(M_PI);
 
+        bool isSelected = (selectedRaw == ac.get());
+
+        // Selection ring — drawn before sprite so sprite renders on top
+        if (isSelected)
+        {
+            painter.setBlending(true);
+            painter.setColor(1.f, 0.85f, 0.1f, 0.9f);
+            painter.drawCircle(sx, sy, 20.f);
+            painter.drawCircle(sx, sy, 22.f);
+        }
+
         // Draw textured sprite
         StelTextureSP tex = getIcon(ac);
         if (tex && tex->bind())
         {
-            painter.setColor(colour, 0.92f);
+            painter.setColor(colour, isSelected ? 1.0f : 0.92f);
             painter.setBlending(true);
             painter.drawSprite2dMode(sx, sy, 13.f, rotDeg);
         }
@@ -602,9 +621,11 @@ void StellAirium::drawAircraft(StelCore* core)
         // Queue metadata fetch if not yet requested
         queueMetaRequest(ac->getIcao24());
 
-        // Callsign / ICAO label
-        painter.setColor(1.f, 1.f, 1.f, 0.85f);
+        // Callsign / ICAO label — brighter when selected
+        painter.setColor(1.f, 1.f, isSelected ? 0.1f : 1.f, isSelected ? 1.f : 0.85f);
         QString label = ac->getCallsign().isEmpty() ? ac->getIcao24() : ac->getCallsign();
+        if (!ac->getRegistration().isEmpty() && isSelected)
+            label += QStringLiteral("  ") + ac->getRegistration();
         painter.drawText(sx + 16.f, sy + 3.f, label);
     }
 }
@@ -724,8 +745,16 @@ QVector<QPair<QString,StelObjectP>> StellAirium::listMatchingObjects(const QStri
     for (const auto& ac : aircrafts_)
     {
         QString name = ac->getEnglishName();
-        if (useStartOfWords ? name.startsWith(prefix, Qt::CaseInsensitive)
-                            : name.contains(prefix, Qt::CaseInsensitive))
+        QString reg  = ac->getRegistration();
+        QString icao = ac->getIcao24();
+
+        auto matches = [&](const QString& field) {
+            if (field.isEmpty()) return false;
+            return useStartOfWords ? field.startsWith(prefix, Qt::CaseInsensitive)
+                                   : field.contains(prefix, Qt::CaseInsensitive);
+        };
+
+        if (matches(name) || matches(reg) || matches(icao))
         {
             result << qMakePair(name, qSharedPointerCast<StelObject>(ac));
             if (result.size() >= maxNbItem) break;
@@ -757,21 +786,93 @@ void StellAirium::fetchNow()
     startFetch();
 }
 
-void StellAirium::startFetch()
+// ---------------------------------------------------------------------------
+// Source helpers
+// ---------------------------------------------------------------------------
+QString StellAirium::sourceName(DataSource s)
+{
+    switch (s) {
+        case DataSource::OpenSky:       return QStringLiteral("OpenSky Network");
+        case DataSource::AdsbFi:        return QStringLiteral("adsb.fi");
+        case DataSource::AirplanesLive: return QStringLiteral("airplanes.live");
+    }
+    return QStringLiteral("Unknown");
+}
+
+QString StellAirium::buildUrl(DataSource s) const
 {
     const StelLocation& loc = StelApp::getInstance().getCore()->getCurrentLocation();
     double lat = static_cast<double>(loc.getLatitude());
     double lon = static_cast<double>(loc.getLongitude());
 
-    double dlat = radiusKm_ / 111.0;
-    double dlon = radiusKm_ / (111.0 * cos(lat * M_PI / 180.0));
+    switch (s) {
+        case DataSource::OpenSky: {
+            double dlat = radiusKm_ / 111.0;
+            double dlon = radiusKm_ / (111.0 * std::cos(lat * M_PI / 180.0));
+            return QString("https://opensky-network.org/api/states/all"
+                           "?lamin=%1&lomin=%2&lamax=%3&lomax=%4")
+                       .arg(lat - dlat, 0, 'f', 4)
+                       .arg(lon - dlon, 0, 'f', 4)
+                       .arg(lat + dlat, 0, 'f', 4)
+                       .arg(lon + dlon, 0, 'f', 4);
+        }
+        case DataSource::AdsbFi: {
+            double radiusNm = radiusKm_ * 0.539957;
+            return QString("https://api.adsb.fi/v1/aircraft?lat=%1&lon=%2&radius=%3")
+                       .arg(lat, 0, 'f', 4)
+                       .arg(lon, 0, 'f', 4)
+                       .arg(radiusNm, 0, 'f', 1);
+        }
+        case DataSource::AirplanesLive: {
+            double radiusNm = radiusKm_ * 0.539957;
+            return QString("https://api.airplanes.live/v2/point/%1/%2/%3")
+                       .arg(lat, 0, 'f', 4)
+                       .arg(lon, 0, 'f', 4)
+                       .arg(static_cast<int>(std::ceil(radiusNm)));
+        }
+    }
+    return {};
+}
 
-    QString url = QString("https://opensky-network.org/api/states/all"
-                          "?lamin=%1&lomin=%2&lamax=%3&lomax=%4")
-                      .arg(lat - dlat, 0, 'f', 4)
-                      .arg(lon - dlon, 0, 'f', 4)
-                      .arg(lat + dlat, 0, 'f', 4)
-                      .arg(lon + dlon, 0, 'f', 4);
+StellAirium::DataSource StellAirium::nextSource(DataSource from) const
+{
+    // Cycle through all sources starting after 'from', return first non-rate-limited
+    for (int i = 1; i < SOURCE_COUNT; ++i)
+    {
+        DataSource candidate = static_cast<DataSource>((static_cast<int>(from) + i) % SOURCE_COUNT);
+        if (!isRateLimited(candidate))
+            return candidate;
+    }
+    return from; // all rate-limited, stay on current
+}
+
+void StellAirium::markRateLimited(DataSource s)
+{
+    rateLimitedUntil_[static_cast<int>(s)] = QDateTime::currentDateTime().addSecs(15 * 60);
+}
+
+bool StellAirium::isRateLimited(DataSource s) const
+{
+    const QDateTime& until = rateLimitedUntil_[static_cast<int>(s)];
+    return until.isValid() && QDateTime::currentDateTime() < until;
+}
+
+// ---------------------------------------------------------------------------
+void StellAirium::startFetch()
+{
+    // If active source is rate-limited, find the next one
+    if (isRateLimited(activeSource_))
+    {
+        DataSource next = nextSource(activeSource_);
+        if (next != activeSource_)
+        {
+            activeSource_ = next;
+            emit activeSourceChanged(activeSource_);
+        }
+    }
+
+    QString url = buildUrl(activeSource_);
+    if (url.isEmpty()) return;
 
     QNetworkRequest req((QUrl(url)));
     req.setHeader(QNetworkRequest::UserAgentHeader,
@@ -787,6 +888,23 @@ void StellAirium::onNetworkReply(QNetworkReply* reply)
 {
     reply->deleteLater();
     fetching_ = false;
+
+    int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+
+    // Rate limited — mark source, switch to next
+    if (httpStatus == 429 || reply->error() == QNetworkReply::ContentAccessDenied)
+    {
+        qWarning() << "StellAirium: rate limited on" << sourceName(activeSource_);
+        markRateLimited(activeSource_);
+        DataSource next = nextSource(activeSource_);
+        if (next != activeSource_)
+        {
+            activeSource_ = next;
+            emit activeSourceChanged(activeSource_);
+        }
+        lastError_ = QString("Rate limited — switched to %1").arg(sourceName(activeSource_));
+        return;
+    }
 
     if (reply->error() != QNetworkReply::NoError)
     {
@@ -806,6 +924,23 @@ void StellAirium::onNetworkReply(QNetworkReply* reply)
         return;
     }
 
+    switch (activeSource_)
+    {
+        case DataSource::OpenSky:       parseOpenSky(doc);       break;
+        case DataSource::AdsbFi:        parseAdsbFi(doc);        break;
+        case DataSource::AirplanesLive: parseAirplanesLive(doc); break;
+    }
+
+    lastFetch_     = QDateTime::currentDateTime();
+    totalReceived_ += aircrafts_.size();
+    emit aircraftUpdated();
+}
+
+// ---------------------------------------------------------------------------
+// Per-source parsers — all normalize to SI units (m, m/s)
+// ---------------------------------------------------------------------------
+void StellAirium::parseOpenSky(const QJsonDocument& doc)
+{
     QJsonArray states = doc.object().value(QStringLiteral("states")).toArray();
 
     const StelLocation& loc = StelApp::getInstance().getCore()->getCurrentLocation();
@@ -827,12 +962,12 @@ void StellAirium::onNetworkReply(QNetworkReply* reply)
         qint64  timePosRaw = s[3].isNull() ? 0 : static_cast<qint64>(s[3].toDouble());
         double  acLon    = s[5].toDouble();
         double  acLat    = s[6].toDouble();
-        double  baroAlt  = s[7].isNull()  ? 0.0 : s[7].toDouble();
+        double  baroAlt  = s[7].isNull()  ? 0.0 : s[7].toDouble();   // metres
         bool    onGround = s[8].toBool();
-        double  velocity = s[9].isNull()  ? 0.0 : s[9].toDouble();
-        double  heading  = s[10].isNull() ? 0.0 : s[10].toDouble();
-        double  vertRate = s[11].isNull() ? 0.0 : s[11].toDouble();
-        double  geoAlt   = s[13].isNull() ? baroAlt : s[13].toDouble();
+        double  velocity = s[9].isNull()  ? 0.0 : s[9].toDouble();   // m/s
+        double  heading  = s[10].isNull() ? 0.0 : s[10].toDouble();  // degrees
+        double  vertRate = s[11].isNull() ? 0.0 : s[11].toDouble();  // m/s
+        double  geoAlt   = s[13].isNull() ? baroAlt : s[13].toDouble(); // metres
         QString squawk   = (s.size() > 14 && !s[14].isNull()) ? s[14].toString() : QString();
         int     posSrc   = (s.size() > 16 && !s[16].isNull()) ? s[16].toInt() : 0;
 
@@ -842,26 +977,88 @@ void StellAirium::onNetworkReply(QNetworkReply* reply)
         auto it = aircrafts_.find(icao24);
         if (it != aircrafts_.end())
         {
-            it.value()->setData(acLat, acLon, baroAlt, geoAlt,
-                                velocity, heading, vertRate, onGround);
+            it.value()->setData(acLat, acLon, baroAlt, geoAlt, velocity, heading, vertRate, onGround);
             it.value()->setFlightInfo(country, squawk, posSrc, timePosRaw);
             updated[icao24] = it.value();
         }
         else
         {
-            auto ac = AircraftObjP::create(icao24, callsign,
-                                           acLat, acLon, baroAlt, geoAlt,
-                                           velocity, heading, vertRate, onGround);
+            auto ac = AircraftObjP::create(icao24, callsign, acLat, acLon,
+                                           baroAlt, geoAlt, velocity, heading, vertRate, onGround);
             ac->setFlightInfo(country, squawk, posSrc, timePosRaw);
             updated[icao24] = ac;
         }
     }
+    aircrafts_ = updated;
+}
 
-    aircrafts_     = updated;
-    lastFetch_     = QDateTime::currentDateTime();
-    totalReceived_ += aircrafts_.size();
+// Shared parser for adsb.fi and airplanes.live (identical JSON schema)
+void StellAirium::parseAdsbExchange(const QJsonDocument& doc, DataSource /*src*/)
+{
+    QJsonArray ac = doc.object().value(QStringLiteral("ac")).toArray();
 
-    emit aircraftUpdated();
+    const StelLocation& loc = StelApp::getInstance().getCore()->getCurrentLocation();
+    double obsLat  = static_cast<double>(loc.getLatitude());
+    double obsLon  = static_cast<double>(loc.getLongitude());
+    double radiusM = radiusKm_ * 1000.0;
+
+    QMap<QString, AircraftObjP> updated;
+
+    for (const QJsonValue& v : ac)
+    {
+        QJsonObject o = v.toObject();
+
+        if (!o.contains(QStringLiteral("lat")) || !o.contains(QStringLiteral("lon"))) continue;
+
+        QString icao24   = o.value(QStringLiteral("hex")).toString().toLower().trimmed();
+        QString callsign = o.value(QStringLiteral("flight")).toString().trimmed();
+        double  acLat    = o.value(QStringLiteral("lat")).toDouble();
+        double  acLon    = o.value(QStringLiteral("lon")).toDouble();
+
+        // alt_baro can be "ground" string or a number (feet)
+        QJsonValue altBaroVal = o.value(QStringLiteral("alt_baro"));
+        bool    onGround = altBaroVal.isString(); // "ground"
+        double  baroAlt  = onGround ? 0.0 : altBaroVal.toDouble() * 0.3048; // ft → m
+
+        double  geoAlt   = o.value(QStringLiteral("alt_geom")).toDouble() * 0.3048; // ft → m
+        double  velocity = o.value(QStringLiteral("gs")).toDouble() * 0.514444;     // kts → m/s
+        double  heading  = o.value(QStringLiteral("track")).toDouble();             // degrees
+        double  vertRate = o.value(QStringLiteral("baro_rate")).toDouble() * 0.00508; // ft/min → m/s
+        QString squawk   = o.value(QStringLiteral("squawk")).toString();
+        qint64  timePosRaw = 0;
+        int     posSrc   = 0;
+
+        if (geoAlt <= 0.0) geoAlt = baroAlt;
+
+        if (greatCircleDistM(obsLat, obsLon, acLat, acLon) > radiusM) continue;
+        if (!showOnGround_ && onGround) continue;
+
+        auto it = aircrafts_.find(icao24);
+        if (it != aircrafts_.end())
+        {
+            it.value()->setData(acLat, acLon, baroAlt, geoAlt, velocity, heading, vertRate, onGround);
+            it.value()->setFlightInfo(QString(), squawk, posSrc, timePosRaw);
+            updated[icao24] = it.value();
+        }
+        else
+        {
+            auto aircraft = AircraftObjP::create(icao24, callsign, acLat, acLon,
+                                                 baroAlt, geoAlt, velocity, heading, vertRate, onGround);
+            aircraft->setFlightInfo(QString(), squawk, posSrc, timePosRaw);
+            updated[icao24] = aircraft;
+        }
+    }
+    aircrafts_ = updated;
+}
+
+void StellAirium::parseAdsbFi(const QJsonDocument& doc)
+{
+    parseAdsbExchange(doc, DataSource::AdsbFi);
+}
+
+void StellAirium::parseAirplanesLive(const QJsonDocument& doc)
+{
+    parseAdsbExchange(doc, DataSource::AirplanesLive);
 }
 
 // ---------------------------------------------------------------------------
@@ -873,19 +1070,38 @@ QString StellAirium::getStatusText() const
         return q_("Plugin disabled.");
 
     if (fetching_)
-        return q_("Fetching data…");
+        return QString(q_("Fetching from %1…")).arg(sourceName(activeSource_));
 
-    if (!lastError_.isEmpty())
-        return QString(q_("Error: %1")).arg(lastError_);
+    QString status;
+
+    // Fallback warning
+    if (activeSource_ != preferredSource_)
+    {
+        const QDateTime& retryAt = rateLimitedUntil_[static_cast<int>(preferredSource_)];
+        int secsLeft = static_cast<int>(QDateTime::currentDateTime().secsTo(retryAt));
+        if (secsLeft > 0)
+        {
+            int m = secsLeft / 60, s = secsLeft % 60;
+            status += QString(q_("⚠ %1 rate limited — retry in %2:%3\n"))
+                          .arg(sourceName(preferredSource_))
+                          .arg(m)
+                          .arg(s, 2, 10, QChar('0'));
+        }
+    }
+
+    if (!lastError_.isEmpty() && lastFetch_.isValid() == false)
+        return status + QString(q_("Error: %1")).arg(lastError_);
 
     if (!lastFetch_.isValid())
-        return q_("Waiting for first update…");
+        return status + q_("Waiting for first update…");
 
     int secsAgo = static_cast<int>(lastFetch_.secsTo(QDateTime::currentDateTime()));
-    return QString(q_("%1 aircraft within %2 km  ·  updated %3 s ago"))
-               .arg(aircrafts_.size())
-               .arg(static_cast<int>(radiusKm_))
-               .arg(secsAgo);
+    status += QString(q_("%1 aircraft · %2 km · %3 s ago · %4"))
+                  .arg(aircrafts_.size())
+                  .arg(static_cast<int>(radiusKm_))
+                  .arg(secsAgo)
+                  .arg(sourceName(activeSource_));
+    return status;
 }
 
 // ---------------------------------------------------------------------------
@@ -936,6 +1152,17 @@ void StellAirium::setShowOnGround(bool v)
     saveSettings();
 }
 
+void StellAirium::setPreferredSource(DataSource s)
+{
+    preferredSource_ = s;
+    // Reset active to preferred and clear its rate-limit so it gets tried immediately
+    rateLimitedUntil_[static_cast<int>(s)] = QDateTime();
+    activeSource_ = s;
+    emit activeSourceChanged(activeSource_);
+    saveSettings();
+    if (enabled_) fetchNow();
+}
+
 void StellAirium::onToggleDialog()
 {
     configureGui(true);
@@ -961,6 +1188,9 @@ void StellAirium::loadSettings()
     radiusKm_        = cfg->value(QStringLiteral("radiusKm"),        50.0).toDouble();
     refreshInterval_ = cfg->value(QStringLiteral("refreshInterval"), 15).toInt();
     showOnGround_    = cfg->value(QStringLiteral("showOnGround"),    false).toBool();
+    preferredSource_ = static_cast<DataSource>(
+        cfg->value(QStringLiteral("dataSource"), 0).toInt());
+    activeSource_    = preferredSource_;
     cfg->endGroup();
 }
 
@@ -972,6 +1202,7 @@ void StellAirium::saveSettings()
     cfg->setValue(QStringLiteral("radiusKm"),        radiusKm_);
     cfg->setValue(QStringLiteral("refreshInterval"), refreshInterval_);
     cfg->setValue(QStringLiteral("showOnGround"),    showOnGround_);
+    cfg->setValue(QStringLiteral("dataSource"),      static_cast<int>(preferredSource_));
     cfg->endGroup();
 }
 

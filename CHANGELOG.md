@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.1.0 — 2026-05-07
+
+### Added
+- **Multiple data sources**: OpenSky Network, adsb.fi, airplanes.live — selectable in plugin settings
+- **Auto-fallback**: on HTTP 429 rate limit, switches to next source; retries preferred after 15 min
+- **Selection ring**: clicking an aircraft shows a yellow highlight ring around it
+- **Search by registration and ICAO24**: Ctrl+F now matches callsign, registration (e.g. SP-LRF) and ICAO24
+- Selected aircraft label shows callsign + registration together
+- Refresh interval range changed to 10–60 s
+- Status label shows active source and fallback countdown timer
+
+### Fixed
+- Info panel text color now correctly follows Stellarium's configured theme
+- Executable renamed to `stellairium.exe`, app name shown as **StellAIRium** everywhere
+
+---
+
 ## v1.0.0 — 2026-05-07
 
 ### Added
