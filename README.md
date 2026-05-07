@@ -1,5 +1,7 @@
 # StellAIRium — Windows Standalone
 
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/kamilzaras)
+
 **StellAIRium** is a customized build of [Stellarium 26.1](https://stellarium.org) for Windows that overlays **live air traffic** on a realistic 3D sky.
 
 Aircraft positions are fetched in real time from ADS-B networks (OpenSky Network, adsb.fi, airplanes.live) and rendered directly on the sky view, oriented by heading and categorized by aircraft type.
